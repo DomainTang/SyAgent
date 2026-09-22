@@ -1,4 +1,11 @@
 # -*- coding: utf-8 -*-
+"""烟羽扩散可视化：把溯源结果渲染成交互式 HTML 地图（folium）。
+
+入口为 :func:`create_plume_visualization`（逐事件渲染）与
+:func:`parse_kml_complete`（解析现场点位/分区底图）。
+本模块内部保留了大量 print 调试输出；调用方（``app.analysis``）在
+stdio 传输下会把这些输出重定向到 stderr，避免污染 MCP 协议通道。
+"""
 import folium
 import xml.etree.ElementTree as ET
 import pandas as pd
@@ -6,8 +13,6 @@ import numpy as np
 import math
 import os
 from datetime import datetime
-
-from paths import DATA_DIR, OUTPUT_DIR
 
 try:
     from scipy.spatial import ConvexHull
@@ -117,71 +122,6 @@ def load_prediction_data(excel_path):
         return df
     except Exception as e:
         print(f"读取Excel文件失败: {e}")
-        return None
-
-
-def load_voc_data_for_event(csv_root_dir, event_time, sensor_id):
-    """根据事件时间和传感器ID加载对应的VOC数据"""
-    try:
-        year = event_time.year
-        month = event_time.month
-        day = event_time.day
-
-        # 构建月份文件夹路径
-        month_folder = f"{year}年{month}月"
-        month_path = os.path.join(csv_root_dir, month_folder)
-
-        # 构建CSV文件名
-        csv_filename = f"jc_doseratedata_{year}_{month:02d}_{day:02d}.csv"
-        csv_path = os.path.join(month_path, csv_filename)
-
-        if not os.path.exists(csv_path):
-            print(f"警告：未找到日期 {event_time.strftime('%Y-%m-%d')} 对应的CSV文件: {csv_path}")
-            return None
-
-        # 读取CSV文件
-        df = pd.read_csv(csv_path, encoding='utf-8')
-
-        # 处理列名
-        if 'mn' in df.columns:
-            df = df.rename(columns={'mn': 'sensor_id'})
-        elif 'sno' in df.columns:
-            df = df.rename(columns={'sno': 'sensor_id'})
-        else:
-            print("警告：CSV中未找到传感器ID列")
-            return None
-
-        if 'sj' not in df.columns:
-            print("警告：CSV中未找到时间列")
-            return None
-
-        df = df.rename(columns={'sj': 'time'})
-        df['sensor_id'] = df['sensor_id'].astype(str)
-        df['sensor_id'] = df['sensor_id'].str[-3:]  # 取后三位
-        df['time'] = pd.to_datetime(df['time'], format='%Y-%m-%d %H:%M:%S')
-        df['voc'] = pd.to_numeric(df['voc'], errors='coerce')
-
-        # 筛选指定传感器和时间窗口（±1分钟）
-        target_sensor = str(sensor_id)[-3:]  # 确保格式一致
-        time_window = pd.Timedelta(minutes=1)
-
-        filtered_df = df[
-            (df['sensor_id'] == target_sensor) &
-            (df['time'] >= event_time - time_window) &
-            (df['time'] <= event_time + time_window)
-            ]
-
-        if not filtered_df.empty:
-            # 返回该时间窗口内的最大VOC值
-            max_voc = filtered_df['voc'].max()
-            print(f"传感器 {target_sensor} 在 {event_time} 附近的最大VOC值: {max_voc}")
-            return max_voc
-        else:
-            print(f"警告：传感器 {target_sensor} 在 {event_time} 附近没有数据")
-            return None
-
-    except Exception as e:
-        print(f"加载VOC数据时出错: {e}")
         return None
 
 
@@ -437,8 +377,13 @@ def create_enhanced_plume_contour(concentration_grid, x_vals, y_vals, source_lat
             return valid_points[:20] if len(valid_points) > 20 else valid_points
 
 
-def create_plume_visualization(kml_path, excel_path, output_html_path=None, current_column_index=0, csv_root_dir=None):
-    """创建烟羽扩散可视化地图"""
+def create_plume_visualization(kml_path, excel_path, output_html_path=None, current_column_index=0,
+                               data_source=None):
+    """创建烟羽扩散可视化地图。
+
+    data_source 非空时（例如 "SIMULATED（本地仿真）"），地图顶部会固定显示数据来源横幅：
+    仿真数据的扩散图不得被当成现场实测结论使用。
+    """
 
     # 解析KML文件
     print(f"正在解析KML文件: {kml_path}")
@@ -649,15 +594,6 @@ def create_plume_visualization(kml_path, excel_path, output_html_path=None, curr
                 if '传感器编号' in column_mapping:
                     sensor_id = str(row[column_mapping['传感器编号']])
 
-                # 如果有CSV数据目录，尝试加载实际VOC数据
-                if csv_root_dir and event_time and sensor_id:
-                    voc_value = load_voc_data_for_event(csv_root_dir, event_time, sensor_id)
-                    if voc_value is not None:
-                        max_voc_value = voc_value
-                        print(f"使用实际VOC数据作为最高浓度值: {max_voc_value}")
-                    else:
-                        print(f"未找到VOC数据，使用默认值: {max_voc_value}")
-
                 # 添加泄漏源标记（确保位置正确）
                 folium.Marker(
                     location=[source_lat, source_lon],  # 确保使用表格中的坐标
@@ -796,59 +732,29 @@ def create_plume_visualization(kml_path, excel_path, output_html_path=None, curr
         output_html_path = "plume_visualization.html"
 
     m.save(output_html_path)
+
+    # 数据来源横幅：直接写入 HTML 头部，确保打开文件的人一眼看到
+    if data_source:
+        banner = (
+            '<div style="position:fixed;top:0;left:0;right:0;z-index:99999;'
+            'background:#c0392b;color:#fff;font:bold 14px/1.6 Microsoft YaHei,sans-serif;'
+            'text-align:center;padding:6px 10px;box-shadow:0 2px 6px rgba(0,0,0,.3);">'
+            f'数据来源：{data_source} —— 非现场实测，仅用于系统联调/演示，严禁用于现场处置决策</div>'
+        )
+        try:
+            with open(output_html_path, 'r', encoding='utf-8') as fp:
+                html_text = fp.read()
+            if '数据来源：' not in html_text:
+                marker = '<body'
+                pos = html_text.find(marker)
+                if pos != -1:
+                    end = html_text.find('>', pos) + 1
+                    html_text = html_text[:end] + banner + html_text[end:]
+                    with open(output_html_path, 'w', encoding='utf-8') as fp:
+                        fp.write(html_text)
+        except OSError as exc:
+            print(f"警告：写入数据来源横幅失败: {exc}")
+
     print(f"烟羽扩散可视化地图已保存到: {output_html_path}")
 
     return m
-
-
-def main():
-    """主函数"""
-    kml_file_path = os.path.join(DATA_DIR, "安庆监测点位及分区 202403.kml")
-    excel_file_path = os.path.join(OUTPUT_DIR, "预测结果.xlsx")
-    output_html_path = os.path.join(OUTPUT_DIR, "烟羽扩散可视化.html")
-
-    # CSV数据根目录（可选，如果提供则会加载实际VOC数据）
-    csv_root_dir = r"F:\2023中石化\安庆监测历史数据\东门大气站"
-
-    # 检查文件是否存在
-    if not os.path.exists(kml_file_path):
-        print(f"错误：KML文件不存在 - {kml_file_path}")
-        return
-
-    if not os.path.exists(excel_file_path):
-        print(f"错误：Excel文件不存在 - {excel_file_path}")
-        return
-
-    try:
-        # 创建烟羽扩散可视化（默认显示第一个事件，索引为0）
-        current_event_index = 0  # 可以修改这个值来显示不同的事件
-        map_obj = create_plume_visualization(
-            kml_file_path,
-            excel_file_path,
-            output_html_path,
-            current_event_index,
-            csv_root_dir  # 传入CSV数据目录
-        )
-        if map_obj:
-            print("\n=== 烟羽扩散可视化完成 ===")
-            print(f"输出文件: {output_html_path}")
-            print(f"当前显示事件: {current_event_index + 1}")
-            print("请在浏览器中打开HTML文件查看交互式地图")
-            print("\n功能说明:")
-            print("- 红色警告标记：疑似泄漏源位置（基于表格中的经纬度数据）")
-            print("- 彩色多边形：高斯烟羽扩散浓度分布（300米范围，平滑边界）")
-            print("- 扩散方向：风向的相反方向")
-            print("- 地图已朝事件点缩放150%")
-            print("- 左上角：显示当前事件的疑似源分析信息")
-            print("- 右上角：图层控制")
-            print("\n提示：修改main()函数中的current_event_index值可显示不同事件")
-
-    except Exception as e:
-        print(f"创建可视化时发生错误: {e}")
-        import traceback
-
-        traceback.print_exc()
-
-
-if __name__ == "__main__":
-    main()

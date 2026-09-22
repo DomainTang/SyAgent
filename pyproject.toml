@@ -1,15 +1,17 @@
 [project]
-name = "syagent-mcp"
-version = "0.1.0"
-description = "石化疑似源识别 MCP Server（Shihua VOC Source Identifier）"
+name = "shihua-mcp"
+version = "0.2.0"
+description = "石化疑似源识别 MCP Server：数据生成 + 溯源分析（含绘图）"
 readme = "README.md"
 requires-python = ">=3.10"
+license = { text = "MIT" }
+keywords = ["mcp", "voc", "source-identification", "petrochemical", "modelscope"]
 dependencies = [
-    "mcp[cli]>=1.9.2",
+    "fastmcp>=2.0",
+    "mcp>=1.9.2",
     "torch>=2.0",
-    "pandas>=1.5",
     "numpy>=1.23",
-    "scikit-learn>=1.2",
+    "pandas>=1.5",
     "scipy>=1.9",
     "matplotlib>=3.6",
     "folium>=0.14",
@@ -17,14 +19,14 @@ dependencies = [
 ]
 
 [project.scripts]
-syagent-mcp = "syagent_mcp.server:main"
+shihua-mcp = "shihua_mcp.server:main"
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/syagent_mcp", "app"]
+packages = ["src/shihua_mcp", "app"]
 
 [tool.hatch.build.targets.sdist]
-include = ["src/syagent_mcp", "app", "README.md", "requirements.txt"]
+include = ["src/shihua_mcp", "app", "README.md", "requirements.txt"]

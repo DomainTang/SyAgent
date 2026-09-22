@@ -1,7 +1,9 @@
+# 石化疑似源识别 MCP 服务依赖（等价于 pyproject.toml 的 dependencies）
+fastmcp>=2.0
+mcp>=1.9.2
 torch>=2.0
-pandas>=1.5
 numpy>=1.23
-scikit-learn>=1.2
+pandas>=1.5
 scipy>=1.9
 matplotlib>=3.6
 folium>=0.14
