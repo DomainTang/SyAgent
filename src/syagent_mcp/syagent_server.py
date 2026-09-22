@@ -1,29 +1,41 @@
 """
 石化疑似源识别 MCP Server 骨架
-建议放置路径：src/syagent_mcp/server.py
-
-依赖新增：uv add "mcp[cli]" fastmcp
-依赖原有：torch / pandas / numpy / scikit-learn / scipy / matplotlib / folium / openpyxl
+路径：src/syagent_mcp/server.py
+依赖：uv add "mcp[cli]" fastmcp
+原有依赖：torch / pandas / numpy / scikit‑learn / scipy / matplotlib / folium / openpyxl
 """
 import os
 import sys
 from pathlib import Path
-
 from fastmcp import FastMCP
+from starlette.routing import Route
+from starlette.responses import JSONResponse
 
-# 让 app/ 目录可被导入（按你的实际结构调整）
+# matplotlib容器无GUI，强制非交互式后端
+os.environ["MPLBACKEND"] = "Agg"
+
+# 让 app/ 目录可被导入
 try:
-    from . import cli  # 当 app 作为包内模块时
+    from . import cli
 except ImportError:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-    from app import cli  # 仓库根目录在 sys.path 时
+    from app import cli
 
-mcp = FastMCP("石化疑似源识别（Shihua VOC）")
+mcp = FastMCP("石化疑似源识别（Shihua VOC）", stateless_http=True)
+
+# ======================新增魔搭健康检查接口======================
+async def health_endpoint(request):
+    """魔搭容器健康探测 /health，返回200 OK"""
+    return JSONResponse({"status": "ok", "service": "syagent-mcp"}, status_code=200)
+
+# 将健康路由注入FastMCP底层starlette app
+if hasattr(mcp, "_app"):
+    mcp._app.routes.append(Route("/health", health_endpoint, methods=["GET"]))
+# ==============================================================
 
 DATA_DIR = Path(os.getenv("SYAGENT_DATA_DIR", "data"))
 MODELS_DIR = Path(os.getenv("SYAGENT_MODELS_DIR", "models"))
-OUTPUT_DIR = Path(os.getenv("SYAGENT_OUTPUT_DIR", "output"))
-
+OUTPUT_DIR = Path(os.getenv("SYAGENT_OUTPUT_DIR", "/tmp/syagent_output"))
 _PREDICTOR = None
 
 
@@ -39,10 +51,12 @@ def _pick_model_path() -> Path:
 
 
 def get_predictor():
-    """懒加载模型：首次调用时才加载，避免启动阻塞。"""
+    """懒加载模型：首次调用工具才加载模型，**启动阶段不加载模型！！**
+    ⚠️非常关键：如果启动main()就加载大torch模型，容器启动时间超时，魔搭健康检查直接失败。
+    懒加载：容器启动只拉起http服务，等Dify真正调用predict_text才加载权重。
+    """
     global _PREDICTOR
     if _PREDICTOR is None:
-        # 按 cli.load_model 的实际返回值解包（model, tokenizer, source2idx, idx2source）
         model, tokenizer, source2idx, idx2source = cli.load_model(str(_pick_model_path()))
         _PREDICTOR = cli.Predictor(model, tokenizer, source2idx, idx2source)
     return _PREDICTOR
@@ -51,8 +65,7 @@ def get_predictor():
 @mcp.tool()
 def predict_text(text: str) -> dict:
     """对单条监测文本做疑似源识别。
-
-    输入形如「传感器…，位置为…」的文本，返回疑似源、经纬度、置信度与 Top-3 候选。
+    输入形如「传感器…，位置为…」的文本，返回疑似源、经纬度、置信度与 Top‑3 候选。
     """
     predictor = get_predictor()
     result = predictor.predict(cli.preprocess_prediction_text(text))
@@ -78,36 +91,53 @@ def batch_predict(
     plume_events: int = 3,
     seed: int | None = None,
 ) -> dict:
-    """批量抽样预测：抽样 → 推理 → 导出 Excel 与统计图表 → 生成烟羽可视化 HTML。"""
+    """批量抽样预测：抽样 → 推理 → 返回结构化统计结果。
+    ⚠️魔搭托管容器为临时实例，不再返回本地磁盘excel/png/html文件路径，只返回内存内统计数据。
+    """
     import random
-
     rng = random.Random(seed) if seed is not None else random.Random()
     chosen = cli.choose_sample_files(str(DATA_DIR), files=files, rng=rng)
     records = []
     for f in chosen:
         for line in cli.read_sample_lines(f, max_lines=max_lines or None, rng=rng):
-            records.append(get_predictor().predict(cli.preprocess_prediction_text(line)))
+            rec = get_predictor().predict(cli.preprocess_prediction_text(line))
+            records.append(rec)
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    excel_path = OUTPUT_DIR / "预测结果.xlsx"
-    cli.save_excel(records, str(excel_path))
-    cli.plot_source_distribution(records, str(OUTPUT_DIR / "预测源分布_Top12.png"))
-    cli.plot_confidence_distribution(records, str(OUTPUT_DIR / "置信度分布.png"))
 
-    kml = next(DATA_DIR.glob("*.kml"), None)
-    plume_dir = OUTPUT_DIR / "plume"
-    if kml:
-        cli.generate_plume_htmls(str(kml), str(excel_path), str(plume_dir), plume_events)
+    source_counter = {}
+    conf_sum = 0.0
+    for item in records:
+        src = item.get("source", "unknown")
+        source_counter[src] = source_counter.get(src, 0) + 1
+        conf = item.get("confidence", 0.0)
+        if isinstance(conf, float):
+            conf_sum += conf
+    avg_confidence = conf_sum / len(records) if records else 0.0
 
     return {
         "count": len(records),
-        "excel": str(excel_path),
-        "plume_index": str(plume_dir / "index.html") if kml else None,
+        "avg_confidence": round(avg_confidence,4),
+        "source_distribution": source_counter,
+        "predict_records": records,
+        "note": "魔搭托管容器为临时环境，Excel/图片/HTML不会持久保存；如需文件请本地Stdio模式运行导出。"
     }
 
 
 def main():
-    mcp.run()
+    """
+    通过环境变量 MCP_TRANSPORT 切换模式：
+    - stdio：本地客户端(Cherry‑Studio/Cursor)使用；
+    - streamable‑http：魔搭可托管部署，Dify调用；
+    """
+    transport = os.getenv("MCP_TRANSPORT", "stdio")
+    port = int(os.getenv("MCP_PORT", "8000"))
+    host = "0.0.0.0"
+
+    if transport == "streamable‑http":
+        mcp.run(transport="streamable‑http", host=host, port=port)
+    else:
+        mcp.run(transport="stdio")
 
 
 if __name__ == "__main__":
