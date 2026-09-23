@@ -52,7 +52,21 @@ ShihuaCLI/
 ## 安装
 
 ```bash
-pip install -r requirements.txt      # 或：pip install -e .
+# 推荐：用工程自带虚拟环境（.venv），避免和系统/Anaconda 的解释器混用
+# Windows
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+# Linux / macOS
+./.venv/bin/python -m pip install -r requirements.txt
+
+# 没有 .venv 时先建一个：
+# python -m venv .venv && .\.venv\Scripts\python.exe -m pip install -r requirements.txt
+```
+
+**依赖装在哪个解释器里，就要用哪个解释器启动**。用系统 Python 或 Anaconda base
+启动会报 `ModuleNotFoundError: No module named 'mcp'`——先跑环境自检确认：
+
+```bash
+.\.venv\Scripts\python.exe server.py --check-env
 ```
 
 ## 使用前准备
@@ -73,7 +87,9 @@ pip install -r requirements.txt      # 或：pip install -e .
 自检（不启动服务，用两种数据来源各跑一遍取数 + 溯源 + 绘图）：
 
 ```bash
-python server.py --self-test
+# Windows 上把 python 换成 .\.venv\Scripts\python.exe，即用装了依赖的解释器
+python server.py --check-env     # 先体检：解释器 / 依赖 / 数据与模型
+python server.py --self-test     # 再跑全流程自检
 ```
 
 本地 stdio 接入（MCP 客户端 / Cherry Studio / Cursor）：
@@ -192,6 +208,13 @@ python tests/test_mcp_server.py     # 工具注册、传输解析、两个工具
 ## 常见问题
 
 - **找不到模型**：把 `voc_model*.pth` 放进 `models/`，或用 `SHIHUA_MODELS_DIR` 指向模型目录。
+- **启动报 `No module named 'mcp' / 'fastmcp'`**：用错解释器了（例如 Anaconda base）。
+  先 `python server.py --check-env`，它会直接告诉你该用哪个解释器；
+  Windows 下通常是 `.\.venv\Scripts\python.exe server.py --http --port 8000`。
+- **启动报 `WinError 10048 / address already in use`**：端口被占用（常见是本机已有别的
+  服务在 8000）。换端口 `--port 8001`，或 `netstat -ano | findstr :8000` 找到 PID 后停掉它。
+- **启动报 `WinError 10048 / address already in use`**：端口被占用（常见是本机已有别的
+  服务在 8000）。换端口 `--port 8001`，或 `netstat -ano | findstr :8000` 找到 PID 后停掉它。
 - **平台报 `No module named 'shihua_mcp'`**：别用 `python -m shihua_mcp.server` 拉裸克隆，
   改用根目录入口 `python server.py`（它会把 `src/` 挂进 `sys.path`）。
 - **平台报 `No module named 'fastmcp' / 'torch'`**：托管平台拉起子进程时不会自动装依赖，

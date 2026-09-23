@@ -50,11 +50,20 @@ os.environ.setdefault("FASTMCP_SHOW_SERVER_BANNER", "false")
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-import mcp.types as mcp_types  # noqa: E402
-from fastmcp import FastMCP  # noqa: E402
-from fastmcp.tools import ToolResult  # noqa: E402
-from fastmcp.utilities.types import Image as MCPImage  # noqa: E402
-from pydantic import Field  # noqa: E402
+try:
+    import mcp.types as mcp_types
+    from fastmcp import FastMCP
+    from fastmcp.tools import ToolResult
+    from fastmcp.utilities.types import Image as MCPImage
+    from pydantic import Field
+except ModuleNotFoundError as exc:  # 依赖没装时给出可执行的提示，而不是裸 traceback
+    from .env_check import check_environment, format_dependency_hint, missing_modules
+
+    if "--check-env" in sys.argv:
+        sys.exit(check_environment())
+    _missing = missing_modules() or [exc.name or "unknown"]
+    print(format_dependency_hint(_missing), file=sys.stderr)
+    sys.exit(2)
 
 from app import sample_data, simulated_data  # noqa: E402
 
@@ -356,6 +365,8 @@ def parse_args(argv: Optional[list] = None) -> argparse.Namespace:
         description="石化疑似源识别 MCP 服务：数据获取 + 模型溯源分析（含绘图）",
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
+    parser.add_argument("--check-env", action="store_true",
+                        help="环境自检：打印解释器、依赖与数据/模型状态后退出")
     parser.add_argument("--self-test", action="store_true",
                         help="自检：列出工具并跑一遍取数 + 溯源，不启动服务")
     parser.add_argument("--transport", default=None,
@@ -371,6 +382,10 @@ def parse_args(argv: Optional[list] = None) -> argparse.Namespace:
 
 def main(argv: Optional[list] = None) -> int:
     args = parse_args(argv)
+    if args.check_env:
+        from .env_check import check_environment
+
+        return check_environment()
     if args.self_test:
         return run_self_test()
 

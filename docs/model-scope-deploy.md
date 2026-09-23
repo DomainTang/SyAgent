@@ -154,6 +154,9 @@ docker run -d -p 8000:8000 -e PORT=8000 shihua-mcp
 ## 5. 本地冒烟验证（部署前先跑这三步）
 
 ```bash
+# 0) 环境体检：解释器对不对、依赖齐不齐、数据与权重在不在
+python server.py --check-env
+
 # 1) 自检：两个工具 + 两种数据来源 + 绘图，全流程
 python server.py --self-test
 
@@ -165,6 +168,10 @@ curl http://127.0.0.1:8000/
 # 3) stdio 模式（平台代理方式）
 python server.py
 ```
+
+Windows 上务必用装了依赖的解释器，例如
+`.\.venv\Scripts\python.exe server.py --http --port 8000`；用系统 Python / Anaconda
+base 会报 `No module named 'mcp'`（依赖装在别处），`--check-env` 会直接指出该用哪个解释器。
 
 ## 6. Dify 侧接入步骤
 
@@ -188,6 +195,8 @@ python server.py
 | --- | --- | --- |
 | `ModuleNotFoundError: No module named 'shihua_mcp'` | 用 `python -m shihua_mcp.server` 拉起裸克隆 | 改用 `python server.py` |
 | `ModuleNotFoundError: No module named 'fastmcp' / 'torch'` | 平台没装依赖 | 用 Docker（第 2 节 A）或 uvx（B） |
+| 报 `No module named 'mcp'`（本地或容器） | 用错解释器：依赖装在 `.venv`，却用了系统 Python / Anaconda base | 先 `python server.py --check-env` 看提示，改用 `<工程>\.venv\Scripts\python.exe server.py ...` |
+| 启动报 `WinError 10048` / `address already in use` | 端口被占用 | 换 `--port 8001`，或停掉占用进程（`netstat -ano \| findstr :8000`） |
 | 构建时报 `COPY failed: models: not found` | 旧版 Dockerfile 依赖 `models/` 目录 | 已修：Dockerfile 建空目录，不 COPY models |
 | 健康检查失败 / 部署超时 | 端口不对或启动太慢 | 服务优先读平台注入的 `PORT`；`/health` 已就绪，冷启动约 1～2 s |
 | `analyze-source` 报“模型加载失败” | 权重没到位 | 提交权重、设 `SHIHUA_MODEL_URL`、或挂载 `SHIHUA_MODELS_DIR` |
