@@ -26,6 +26,7 @@ Streamable HTTP / SSE 调用。工程结构参照 `12306-mcp`：一个服务入�
 
 ```
 ShihuaCLI/
+├── server.py                  # ★ 根目录启动入口（平台托管填 `python server.py`）
 ├── src/shihua_mcp/
 │   └── server.py              # ★ MCP 服务入口：两个工具 + stdio/HTTP/SSE 传输
 ├── app/                       # 核心算法库（无 MCP 依赖，可单独复用）
@@ -63,7 +64,8 @@ pip install -r requirements.txt      # 或：pip install -e .
 | `data/语料库带经维度2020-2025.txt` | 疑似源坐标知识库 | 坐标退化为默认值（不阻塞） |
 | `data/安庆监测点位及分区 202403.kml` | 烟羽扩散底图 | 自动生成“示例点位底图”（名称带“示例”前缀） |
 
-模型权重约 15 MB。部署到魔搭时请确保服务能读到权重：随仓库提交，或上传后用
+模型权重约 15 MB。托管部署时三种做法任选：随仓库提交（`.gitignore` 已不再忽略
+`models/*.pth`）、设 `SHIHUA_MODEL_URL` 让服务首次分析时自动下载、或用
 `SHIHUA_MODELS_DIR` 指向挂载目录。
 
 ## 快速开始
@@ -71,7 +73,7 @@ pip install -r requirements.txt      # 或：pip install -e .
 自检（不启动服务，用两种数据来源各跑一遍取数 + 溯源 + 绘图）：
 
 ```bash
-python -m shihua_mcp.server --self-test
+python server.py --self-test
 ```
 
 本地 stdio 接入（MCP 客户端 / Cherry Studio / Cursor）：
@@ -81,22 +83,39 @@ python -m shihua_mcp.server --self-test
   "mcpServers": {
     "shihua-mcp": {
       "command": "python",
-      "args": ["-m", "shihua_mcp.server"]
+      "args": ["server.py"]
     }
   }
 }
 ```
 
+（`pip install -e .` 之后也可用控制台脚本 `shihua-mcp` 或 `python -m shihua_mcp.server`。）
+
 容器 / 云端用 HTTP + SSE：
 
 ```bash
-python -m shihua_mcp.server --http --port 8000
+python server.py --http --port 8000
 # Streamable HTTP: POST http://127.0.0.1:8000/mcp
 # SSE:             GET  http://127.0.0.1:8000/sse
+# 健康检查:        GET  http://127.0.0.1:8000/health
 ```
 
-部署到魔搭（ModelScope）MCP 广场时推荐 **Stdio 托管**（平台自动生成 SSE 地址），
-创建页各项填法与三种部署方式的配置见 [魔搭部署指南](./docs/model-scope-deploy.md)。
+## 托管部署（魔搭 → 拿公网地址 → 填进 Dify）
+
+推荐用仓库自带 Dockerfile 以容器 + HTTP 方式部署，平台会给你一个公网域名，
+Dify 侧直接用 `https://<域名>/mcp`（Streamable HTTP）或 `https://<域名>/sse`（SSE）：
+
+```bash
+docker build -t shihua-mcp .
+docker run -d -p 8000:8000 -e PORT=8000 shihua-mcp
+curl http://127.0.0.1:8000/health
+```
+
+Stdio 托管方式（平台在前面挂 SSE 代理）把启动命令填成 `python server.py`；
+若平台支持 uvx 自动装依赖，可用
+`uvx --from git+https://github.com/<你的账号>/ShihuaCLI shihua-mcp`。
+三种方式的完整配置、创建页填法、Dify 接入步骤与排错清单见
+[魔搭托管部署 + Dify 接入指南](./docs/model-scope-deploy.md)。
 
 ## 工具返回内容
 
@@ -145,6 +164,7 @@ python -m shihua_mcp.server --http --port 8000
 | `SHIHUA_DATA_DIR` | 仓库 `data/` | 测试文本、语料库与 KML 目录 |
 | `SHIHUA_MODELS_DIR` | 仓库 `models/` | 模型权重目录 |
 | `SHIHUA_OUTPUT_DIR` | 仓库 `output/` | 产物目录（需可写；只读文件系统请指向 `/tmp`） |
+| `SHIHUA_MODEL_URL` | 无 | 本地没有权重时自动下载的地址（http/https/file 均可） |
 
 ## 运行产物
 
@@ -172,6 +192,13 @@ python tests/test_mcp_server.py     # 工具注册、传输解析、两个工具
 ## 常见问题
 
 - **找不到模型**：把 `voc_model*.pth` 放进 `models/`，或用 `SHIHUA_MODELS_DIR` 指向模型目录。
+- **平台报 `No module named 'shihua_mcp'`**：别用 `python -m shihua_mcp.server` 拉裸克隆，
+  改用根目录入口 `python server.py`（它会把 `src/` 挂进 `sys.path`）。
+- **平台报 `No module named 'fastmcp' / 'torch'`**：托管平台拉起子进程时不会自动装依赖，
+  用 Docker 方式部署，或让平台用 uvx（会自动建环境装依赖）。
+- **拿不到公网地址 / 健康检查失败**：容器方式已内置 `GET /health`，服务优先读平台注入的
+  `PORT`；确认镜像里能构建成功（旧版 Dockerfile 会因 `COPY models` 缺目录而构建失败，已修）。
+- **Dify 调用超时**：首次调用 `analyze-source` 要加载 torch 与权重，把工具超时调到 ≥60 s。
 - **中文标签乱码**：Linux 容器里装一个中文字体（如 `fonts-wqy-zenhei`）；Windows 用黑体/雅黑。
 - **烟羽地图底图空白**：HTML 已生成，地图瓦片需要浏览器联网加载。
 - **日志出现 `增强轮廓生成失败，使用备用方法`**：新版 matplotlib 移除了

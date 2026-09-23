@@ -3,20 +3,39 @@
 
 解析优先级（先命中先用）：
 1. 环境变量 ``SHIHUA_DATA_DIR`` / ``SHIHUA_MODELS_DIR`` / ``SHIHUA_OUTPUT_DIR``；
-2. 仓库根目录下的 ``data`` / ``models`` / ``output``（克隆仓库后直接运行）；
-3. 当前工作目录下的同名目录（以 wheel / uvx 方式安装后运行）。
+2. 源码/克隆目录下的 ``data`` / ``models`` / ``output``（``python server.py`` 运行）；
+3. 已安装包的所在目录（``pip install`` / ``uvx`` 后 data、models 随包分发）；
+4. 当前工作目录及其上三级（平台通常在仓库目录里拉起子进程）。
 
 全部返回绝对路径：MCP 服务由客户端或平台拉起时，工作目录未必是仓库根目录，
 用相对路径会直接读不到模型文件（历史上踩过这个坑）。
 """
 from __future__ import annotations
 
+import logging
 import os
+import shutil
+import tempfile
+import urllib.request
 from datetime import datetime
 from pathlib import Path
+from typing import Optional
+
+logger = logging.getLogger(__name__)
+
+MODEL_URL_ENV = "SHIHUA_MODEL_URL"
 
 APP_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = APP_DIR.parent
+
+
+def _candidate_roots() -> list[Path]:
+    """按“源码目录 → 安装目录 → 工作目录”的顺序给出候选根目录。"""
+    roots = [PROJECT_ROOT, APP_DIR.parent]
+    cwd = Path.cwd().resolve()
+    roots.append(cwd)
+    roots.extend(list(cwd.parents)[:3])
+    return roots
 
 
 def _resolve_dir(env_names: tuple[str, ...], dirname: str) -> Path:
@@ -24,13 +43,11 @@ def _resolve_dir(env_names: tuple[str, ...], dirname: str) -> Path:
         raw = os.getenv(env_name)
         if raw:
             return Path(raw).expanduser().resolve()
-    repo_candidate = PROJECT_ROOT / dirname
-    if repo_candidate.is_dir():
-        return repo_candidate
-    cwd_candidate = Path.cwd() / dirname
-    if cwd_candidate.is_dir():
-        return cwd_candidate
-    return repo_candidate
+    for root in _candidate_roots():
+        candidate = root / dirname
+        if candidate.is_dir():
+            return candidate
+    return PROJECT_ROOT / dirname
 
 
 DATA_DIR = _resolve_dir(("SHIHUA_DATA_DIR",), "data")
@@ -57,8 +74,45 @@ def find_model_path() -> Path:
             return candidate
     raise FileNotFoundError(
         f"未在 {MODELS_DIR} 下找到 voc_model_retrained.pth / voc_model.pth；"
-        "请把模型权重放入 models/，或用 SHIHUA_MODELS_DIR 指向模型目录"
+        "请把模型权重放入 models/，用 SHIHUA_MODELS_DIR 指向模型目录，"
+        f"或设置 {MODEL_URL_ENV} 让服务启动时自动下载"
     )
+
+
+def download_model(url: str, target: Optional[Path] = None, timeout: float = 300.0) -> Path:
+    """把权重下载到 ``MODELS_DIR``（先写临时文件再改名，避免半截文件被加载）。"""
+    MODELS_DIR.mkdir(parents=True, exist_ok=True)
+    if target is None:
+        name = Path(url.split("?")[0]).name
+        target = MODELS_DIR / (name if name.endswith(".pth") else MODEL_RETRAINED_FILE.name)
+    request = urllib.request.Request(url, headers={"User-Agent": "shihua-mcp/0.3"})
+    fd, tmp_name = tempfile.mkstemp(prefix=target.name + ".", suffix=".part",
+                                    dir=str(target.parent))
+    os.close(fd)  # 必须先关掉临时文件句柄，否则 Windows 上无法改名/删除
+    tmp = Path(tmp_name)
+    try:
+        logger.info("正在下载模型权重：%s -> %s", url, target)
+        with urllib.request.urlopen(request, timeout=timeout) as resp, open(tmp, "wb") as fp:
+            shutil.copyfileobj(resp, fp)
+        if tmp.stat().st_size == 0:
+            raise OSError(f"下载到的文件为空: {url}")
+        tmp.replace(target)
+        logger.info("模型权重下载完成（%.1f MB）: %s", target.stat().st_size / 1024 / 1024, target)
+        return target
+    finally:
+        if tmp.exists():
+            tmp.unlink(missing_ok=True)
+
+
+def ensure_model_file(model_url: Optional[str] = None) -> Path:
+    """返回可用权重路径；本地缺失且配置了 ``SHIHUA_MODEL_URL`` 时自动下载。"""
+    try:
+        return find_model_path()
+    except FileNotFoundError:
+        url = model_url or os.getenv(MODEL_URL_ENV)
+        if not url:
+            raise
+        return download_model(url)
 
 
 def new_run_dir(output_root: str | os.PathLike | None = None) -> Path:

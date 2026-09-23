@@ -89,7 +89,8 @@ def _infer_model_params(state_dict) -> Tuple[int, int, int, int, int]:
 
 def load_predictor(model_path: str | None = None) -> Predictor:
     """加载模型权重并返回 Predictor。"""
-    path = str(model_path) if model_path else str(paths.find_model_path())
+    # 本地没有权重时，按 SHIHUA_MODEL_URL 自动下载（托管部署常见做法）
+    path = str(model_path) if model_path else str(paths.ensure_model_file())
     checkpoint = torch.load(path, map_location='cpu', weights_only=False)
     logger.info("checkpoint 键: %s", list(checkpoint.keys()))
     state_dict = checkpoint['model_state_dict']

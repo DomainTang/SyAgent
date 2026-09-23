@@ -10,8 +10,11 @@ dist/
 # 运行产物（每次分析都会新建 run_YYYYmmdd_HHMMSS/）
 output/
 
-# 模型权重：本地忽略，但**部署前必须保证服务能读到**
-# （随仓库提交、或上传到魔搭数据集/模型仓库后用 SHIHUA_MODELS_DIR 指向）
-models/
-*.pth
-data/*.pth
+# 模型权重（约 15 MB/个）：托管部署时服务必须能读到，三种做法任选
+#   1) 直接提交 models/*.pth（当前未忽略，git add 即生效）
+#   2) 上传到魔搭数据集/模型仓库，运行时设 SHIHUA_MODEL_URL 自动下载
+#   3) 挂载目录并设 SHIHUA_MODELS_DIR
+# 想回到“不提交权重”，把下面两行取消注释即可：
+# models/
+# *.pth
+*.part

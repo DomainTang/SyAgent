@@ -1,0 +1,10 @@
+models/ 目录说明：
+把模型权重放到这里（三种做法任选，见 docs/model-scope-deploy.md 第 3 节）：
+1. 直接放本地：voc_model_retrained.pth（优先）/ voc_model.pth；
+2. 设 SHIHUA_MODEL_URL=<可下载地址>，服务首次分析时自动下载到本目录；
+3. 托管部署时挂载目录，并把 SHIHUA_MODELS_DIR 指向它。
+
+权重约 15 MB，是溯源分析（analyze-source 工具）的必需项；缺失时该工具会如实返回
+“模型加载失败”。服务启动与数据获取（get-monitoring-data 工具）不受影响。
+
+注意：.gitignore 已不再忽略本目录的 *.pth，提交权重后托管部署即可直接读到。

@@ -12,13 +12,18 @@
 启动方式：
 
 ```bash
-python -m shihua_mcp.server                     # stdio（MCP 客户端 / 平台托管，推荐）
-python -m shihua_mcp.server --self-test         # 自检：列工具 + 跑一遍取数与溯源，不起服务
-python -m shihua_mcp.server --http --port 8000  # Streamable HTTP + SSE（容器 / 云端）
+python server.py                     # stdio（裸克隆即可，平台托管填这个命令）
+python server.py --self-test         # 自检：列工具 + 跑一遍取数与溯源，不起服务
+python server.py --http --port 8000  # Streamable HTTP + SSE（容器 / 云端，给 Dify 用）
+python -m shihua_mcp.server --http   # pip install 之后也可以这样起
 ```
 
 环境变量：``MCP_TRANSPORT``（stdio/http/sse）、``HOST`` / ``PORT``、``MCP_HTTP_PATH``、
-``SHIHUA_DATA_DIR`` / ``SHIHUA_MODELS_DIR`` / ``SHIHUA_OUTPUT_DIR``。
+``MCP_CORS_ORIGINS``、``SHIHUA_DATA_DIR`` / ``SHIHUA_MODELS_DIR`` / ``SHIHUA_OUTPUT_DIR``、
+``SHIHUA_MODEL_URL``（本地没有权重时自动下载）。
+
+HTTP 模式下额外提供 ``GET /health``（健康检查）与 ``GET /``（服务信息），
+便于容器平台与网关探活。
 
 注意：stdio 模式下 stdout 是 JSON-RPC 通道，本服务所有日志一律走 stderr。
 """
@@ -51,7 +56,7 @@ from fastmcp.tools import ToolResult  # noqa: E402
 from fastmcp.utilities.types import Image as MCPImage  # noqa: E402
 from pydantic import Field  # noqa: E402
 
-from app import analysis, sample_data, simulated_data  # noqa: E402
+from app import sample_data, simulated_data  # noqa: E402
 
 logging.basicConfig(
     level=logging.INFO,
@@ -62,6 +67,7 @@ logger = logging.getLogger("shihua_mcp")
 
 VERSION = "0.3.0"
 SERVER_NAME = "shihua-voc-mcp"
+TOOL_NAMES = ("get-monitoring-data", "analyze-source")
 
 DEFAULT_HTTP_HOST = "0.0.0.0"
 DEFAULT_HTTP_PORT = 8000
@@ -85,6 +91,48 @@ mcp = FastMCP(
     version=VERSION,
     instructions=SERVER_INSTRUCTIONS,
 )
+
+
+def _analysis():
+    """延迟导入分析栈（torch / matplotlib / folium）。
+
+    MCP 服务启动阶段只加载轻量的取数模块，让托管平台与客户端的握手在秒级完成；
+    首次调用 ``analyze-source`` 时才载入 torch 与模型权重。
+    """
+    from app import analysis
+
+    return analysis
+
+
+@mcp.custom_route("/health", methods=["GET"])
+async def _health_route(_request):
+    """健康检查：容器平台 / 网关探活用。"""
+    from starlette.responses import JSONResponse
+
+    return JSONResponse({
+        "status": "ok",
+        "server": SERVER_NAME,
+        "version": VERSION,
+        "tools": list(TOOL_NAMES),
+    })
+
+
+@mcp.custom_route("/", methods=["GET"])
+async def _index_route(_request):
+    """服务信息页：浏览器直接访问时给出可用端点与工具列表。"""
+    from starlette.responses import JSONResponse
+
+    return JSONResponse({
+        "server": SERVER_NAME,
+        "version": VERSION,
+        "tools": list(TOOL_NAMES),
+        "endpoints": {
+            "streamable_http": os.getenv("MCP_HTTP_PATH", DEFAULT_HTTP_PATH),
+            "sse": "/sse",
+            "health": "/health",
+        },
+        "usage": "MCP 客户端把上面的端点拼到服务地址后面即可；Dify 的 MCP 工具可直接填 /mcp 或 /sse。",
+    })
 
 GET_MONITORING_DATA_DESCRIPTION = (
     "获取一批厂区监测数据。需要数据时直接调用本工具，不要向用户索要、也不要自行编造数值。\n\n"
@@ -170,7 +218,7 @@ def analyze_source(
     ] = 0,
 ) -> ToolResult:
     """调用模型做疑似源溯源分析，并绘制预测源分布图与置信度分布图。"""
-    payload = analysis.run_analysis(
+    payload = _analysis().run_analysis(
         data=data, source=source, seed=seed, top_k=top_k, plume_events=plume_events)
 
     content: list = [mcp_types.TextContent(
@@ -200,9 +248,12 @@ def analyze_source(
 def run_self_test() -> int:
     """自检：打印已注册工具，并用两种数据来源各跑一遍取数 + 溯源 + 绘图。"""
     tools = asyncio.run(mcp.list_tools())
+    analysis = _analysis()
     print(f"[自检] 已注册 MCP 工具（{len(tools)}）: " + ", ".join(t.name for t in tools))
     print(f"[自检] 数据目录: {analysis.paths.DATA_DIR}")
     print(f"[自检] 模型目录: {analysis.paths.MODELS_DIR}")
+    print(f"[自检] 权重自动下载 {analysis.paths.MODEL_URL_ENV}: "
+          f"{os.getenv(analysis.paths.MODEL_URL_ENV) or '未设置'}")
 
     for source in (sample_data.SOURCE_SAMPLE, sample_data.SOURCE_SIMULATED):
         print("\n" + "=" * 80)
