@@ -10,6 +10,6 @@
 包初始化时提前导入会触发 runpy 的 "found in sys.modules" 警告。）
 """
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 
 __all__ = ["VERSION"]

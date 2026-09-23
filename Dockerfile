@@ -13,7 +13,6 @@ ENV PYTHONUNBUFFERED=1 \
     MPLBACKEND=Agg \
     HOST=0.0.0.0 \
     PORT=8000 \
-    SHIHUA_DATA_MODE=simulate \
     FASTMCP_HOME=/app/output/.fastmcp \
     FASTMCP_CHECK_FOR_UPDATES=off
 

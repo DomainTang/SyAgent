@@ -6,7 +6,7 @@
 
 三条不可突破的约束：
 1. 生成的数据恒定携带 ``data_source = "SIMULATED"`` 与 ``simulation_id``；
-2. 文本渲染时恒定输出【数据来源】行（见 ``app.realtime_data``）；
+2. 文本渲染时恒定输出【数据来源】行（见 ``app.monitoring_text``）；
 3. 不存在任何"去掉仿真标记"的开关。
 
 仿真值不是实测值，任何现场处置决策都必须以现场仪表/DCS 读数为准。
@@ -17,7 +17,7 @@ import random
 from datetime import datetime, timedelta
 from typing import Any, Optional
 
-from .realtime_data import DATA_SOURCE_SIMULATED, SIMULATION_NOTICE
+from .monitoring_text import DATA_SOURCE_SIMULATED, SIMULATION_NOTICE
 
 # ============================================================
 # 1. 厂区基础台账（点位名称取自现场监测点命名习惯）

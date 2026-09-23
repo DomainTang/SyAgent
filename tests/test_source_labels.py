@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""数据来源标记端到端自检：Excel 列、图表水印、烟羽地图横幅、结果文本。
+"""端到端自检：数据来源标记在 Excel / 图表 / 烟羽地图 / 结果文本里不得丢失。
 
 运行方式（二选一）:
     python tests/test_source_labels.py
@@ -17,10 +17,11 @@ import pandas as pd  # noqa: E402
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from app import analysis, charts, paths, realtime_data  # noqa: E402
+from app import analysis, charts, monitoring_text as mt, paths  # noqa: E402
 from app.plume_visualization import create_plume_visualization  # noqa: E402
 
-SIMULATED_LABEL = realtime_data.DATA_SOURCE_LABEL[realtime_data.DATA_SOURCE_SIMULATED]
+SIMULATED_LABEL = mt.DATA_SOURCE_LABEL[mt.DATA_SOURCE_SIMULATED]
+SAMPLE_LABEL = mt.DATA_SOURCE_LABEL[mt.DATA_SOURCE_SAMPLE]
 
 KML_TEMPLATE = """<?xml version="1.0" encoding="UTF-8"?>
 <kml><Document>
@@ -53,10 +54,13 @@ def _fake_records(data_source):
 
 
 def test_excel_carries_data_source_column():
-    rows = analysis.result_rows(_fake_records(realtime_data.DATA_SOURCE_SIMULATED), SIMULATED_LABEL)
+    rows = analysis.result_rows(_fake_records(mt.DATA_SOURCE_SIMULATED), SIMULATED_LABEL)
     assert rows[0]["数据来源"] == SIMULATED_LABEL
     assert rows[0]["疑似源分析"].endswith("(117.02958715,30.52963611)")
     assert "乙苯装置（117.02958715" not in rows[0]["疑似源分析"], "坐标不应重复出现两次"
+
+    rows = analysis.result_rows(_fake_records(mt.DATA_SOURCE_SAMPLE), SAMPLE_LABEL)
+    assert rows[0]["数据来源"] == SAMPLE_LABEL
 
 
 def test_chart_watermark_added_only_for_simulated():
@@ -114,41 +118,53 @@ def test_plume_index_page_carries_source_banner():
             assert "SIMULATED" in fp.read()
 
 
-def test_analysis_marks_simulated_everywhere():
-    """端到端：仿真数据一路跑到 Excel / 图表 / 文本，来源标记不得丢失。"""
+def test_simulated_analysis_marks_source_everywhere():
     with tempfile.TemporaryDirectory() as tmp:
-        payload = analysis.run_analysis(seed=42, output_root=tmp)
+        payload = analysis.run_analysis(source="simulated", seed=42, output_root=tmp)
         assert payload["status"] == "success"
-        assert payload["data_source"] == realtime_data.DATA_SOURCE_SIMULATED
+        assert payload["data_source"] == mt.DATA_SOURCE_SIMULATED
         assert payload["data_source_label"] == SIMULATED_LABEL
         assert "SIMULATED" in payload["text_report"]
         assert "严禁用于现场处置决策" in payload["text_report"]
 
         excel_path = payload["artifacts"]["excel"]
         assert excel_path and os.path.exists(excel_path)
-        df = pd.read_excel(excel_path)
-        assert set(df["数据来源"]) == {SIMULATED_LABEL}
+        assert set(pd.read_excel(excel_path)["数据来源"]) == {SIMULATED_LABEL}
 
-        chart_names = [c["name"] for c in payload["artifacts"]["charts"]]
-        assert chart_names == ["预测源分布_Top12", "置信度分布"]
+        assert [c["name"] for c in payload["artifacts"]["charts"]] == ["预测源分布_Top12", "置信度分布"]
         for chart in payload["artifacts"]["charts"]:
             assert os.path.exists(chart["path"])
 
-        # 输入文本里的【数据来源】行必须被识别，而不是被当成用户数据
-        envelope = realtime_data.acquire_monitoring_data(seed=42)
-        replayed = analysis.run_analysis(envelope["text"], seed=42, output_root=tmp)
-        assert replayed["data_source"] == realtime_data.DATA_SOURCE_SIMULATED
-        assert replayed["simulation_id"] == envelope["simulation_id"]
+
+def test_sample_analysis_uses_bundled_test_text():
+    with tempfile.TemporaryDirectory() as tmp:
+        payload = analysis.run_analysis(source="sample", seed=11, max_lines=4, output_root=tmp)
+        assert payload["status"] == "success"
+        assert payload["data_source"] == mt.DATA_SOURCE_SAMPLE
+        assert payload["data_source_label"] == SAMPLE_LABEL
+        assert payload["input"]["sources"], "应记录抽到的样本文件"
+        assert "SAMPLE" in payload["text_report"]
+        assert "严禁用于现场处置决策" not in payload["text_report"]
+        assert set(pd.read_excel(payload["artifacts"]["excel"])["数据来源"]) == {SAMPLE_LABEL}
 
 
 def test_analysis_inputs_are_interchangeable():
-    envelope = realtime_data.acquire_monitoring_data(seed=7, scenario="leak", point_count=4)
-    for data in (envelope["text"], envelope["monitoring"],
-                 "\n".join(envelope["text"].split("【气体浓度】")[1].splitlines()[:2]),
+    from app import sample_data
+
+    envelope = sample_data.acquire_data(source="simulated", seed=7, scenario="leak", point_count=4)
+    for data in (envelope["text"], envelope["monitoring"], envelope["sample_lines"],
                  "传感器141，位置为生产指挥中心，风速为2级，风向为东北风"):
         inputs = analysis.resolve_inputs(data)
         assert inputs["sample_lines"], data
         assert all(analysis.is_sample_line(line) for line in inputs["sample_lines"])
+
+    # 仿真文本回放后仍应识别为 SIMULATED，并保留批次号
+    replayed = analysis.run_analysis(envelope["text"], seed=7)
+    assert replayed["data_source"] == mt.DATA_SOURCE_SIMULATED
+    assert replayed["simulation_id"] == envelope["simulation_id"]
+
+    # 未声明来源的样本行归为 USER
+    assert analysis.resolve_inputs("传感器141，位置为生产指挥中心")["data_source"] == mt.DATA_SOURCE_USER
 
 
 def test_data_dirs_are_absolute():

@@ -62,8 +62,17 @@ def find_model_path() -> Path:
 
 
 def new_run_dir(output_root: str | os.PathLike | None = None) -> Path:
-    """创建本次运行的输出目录 ``<output_root>/run_YYYYmmdd_HHMMSS``。"""
+    """创建本次运行的输出目录 ``<output_root>/run_YYYYmmdd_HHMMSS``。
+
+    同一秒内多次分析时自动追加序号，保证每次运行的产物不会互相覆盖。
+    """
     root = Path(output_root or OUTPUT_DIR)
-    run_dir = root / datetime.now().strftime("run_%Y%m%d_%H%M%S")
-    run_dir.mkdir(parents=True, exist_ok=True)
-    return run_dir
+    base = datetime.now().strftime("run_%Y%m%d_%H%M%S")
+    for attempt in range(1, 1000):
+        candidate = root / (base if attempt == 1 else f"{base}_{attempt}")
+        try:
+            candidate.mkdir(parents=True, exist_ok=False)
+            return candidate
+        except FileExistsError:
+            continue
+    raise RuntimeError(f"同一秒内运行次数过多，无法创建输出目录: {root}")

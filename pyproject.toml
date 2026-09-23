@@ -1,7 +1,7 @@
 [project]
 name = "shihua-mcp"
-version = "0.2.0"
-description = "石化疑似源识别 MCP Server：数据生成 + 溯源分析（含绘图）"
+version = "0.3.0"
+description = "石化疑似源识别 MCP Server：数据获取 + 模型溯源分析（含绘图）"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }

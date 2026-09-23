@@ -6,6 +6,7 @@
     pytest tests/test_mcp_server.py
 """
 import asyncio
+import json
 import os
 import sys
 import tempfile
@@ -16,10 +17,24 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 sys.path.insert(0, os.path.join(ROOT, "src"))
 
-from app import paths, realtime_data as rd  # noqa: E402
+from app import monitoring_text as mt  # noqa: E402
+from app import paths  # noqa: E402
 from shihua_mcp import server as srv  # noqa: E402
 
 EXPECTED_TOOLS = {"get-monitoring-data", "analyze-source"}
+
+
+def _with_temp_output(func):
+    """把产物目录临时指到临时目录，避免污染仓库 output/。"""
+    def wrapper():
+        with tempfile.TemporaryDirectory() as tmp:
+            original = paths.OUTPUT_DIR
+            paths.OUTPUT_DIR = tmp  # type: ignore[assignment]
+            try:
+                return func()
+            finally:
+                paths.OUTPUT_DIR = original  # type: ignore[assignment]
+    return wrapper
 
 
 # ---------------------------------------------------------------- 注册与传输
@@ -46,7 +61,7 @@ def test_server_mode_defaults_to_stdio():
 
 
 def test_server_mode_http_when_port_or_flag_given():
-    transport, host, port, _ = srv.resolve_server_mode(srv.parse_args(["--port", "8080"]))
+    transport, _, port, _ = srv.resolve_server_mode(srv.parse_args(["--port", "8080"]))
     assert (transport, port) == ("http", 8080)
     transport, _, _, _ = srv.resolve_server_mode(srv.parse_args(["--sse"]))
     assert transport == "sse"
@@ -65,45 +80,44 @@ def test_server_mode_reads_transport_env():
             os.environ["MCP_TRANSPORT"] = original
 
 
-# ---------------------------------------------------------------- 工具 1：数据生成
-def test_get_monitoring_data_returns_usable_batch():
-    env = srv.get_monitoring_data(seed=42)
+# ---------------------------------------------------------------- 工具 1：数据获取
+def test_get_monitoring_data_defaults_to_bundled_test_text():
+    env = srv.get_monitoring_data(seed=42, max_lines=3)
     assert env["status"] == "ok"
-    assert env["data_source"] == rd.DATA_SOURCE_SIMULATED
-    assert env["monitoring"]["气体浓度"], "应至少返回一个点位"
-    assert env["validation"]["proceed"] is True
-    assert "【数据来源】" in env["text"] and "SIMULATED" in env["text"]
-    assert env["simulation_id"].startswith("SIM-")
-    assert len(env["sample_lines"]) == len(env["monitoring"]["气体浓度"])
+    assert env["data_source"] == mt.DATA_SOURCE_SAMPLE
+    assert env["text"].startswith("【数据来源】") and "SAMPLE" in env["text"]
+    assert env["sources"], "应给出抽到的样本文件"
+    assert env["sample_lines"], "应给出模型可消费的样本行"
     assert "analyze-source" in env["next_step"]
 
 
-def test_get_monitoring_data_respects_point_count_and_scenario():
-    env = srv.get_monitoring_data(seed=1, scenario="leak", point_count=3)
-    assert len(env["monitoring"]["气体浓度"]) == 3
+def test_get_monitoring_data_can_generate_simulated_batch():
+    env = srv.get_monitoring_data(source="simulated", seed=42, scenario="leak", point_count=4)
+    assert env["status"] == "ok"
+    assert env["data_source"] == mt.DATA_SOURCE_SIMULATED
+    assert env["simulation_id"].startswith("SIM-")
+    assert len(env["monitoring"]["气体浓度"]) == 4
     assert env["scenario"] == "leak"
+    assert "SIMULATED" in env["notice"]
 
 
-def test_get_monitoring_data_rejects_unknown_scenario():
-    env = srv.get_monitoring_data(scenario="nope")
-    assert env["status"] == "error" and "未知场景" in env["error"]
+def test_get_monitoring_data_rejects_unknown_inputs():
+    assert srv.get_monitoring_data(scenario="nope")["status"] == "error"
+    assert srv.get_monitoring_data(source="file")["status"] == "error"
 
 
-# ---------------------------------------------------------------- 工具 2：溯源分析
+# ---------------------------------------------------------------- 工具 2：模型分析
 def test_analyze_source_returns_report_and_charts():
-    with tempfile.TemporaryDirectory() as tmp:
-        original = paths.OUTPUT_DIR
-        paths.OUTPUT_DIR = tmp  # type: ignore[assignment]
-        try:
-            envelope = srv.get_monitoring_data(seed=42, scenario="leak")
-            result = srv.analyze_source(data=envelope["text"], seed=42)
-        finally:
-            paths.OUTPUT_DIR = original  # type: ignore[assignment]
+    @_with_temp_output
+    def run():
+        envelope = srv.get_monitoring_data(source="simulated", seed=42, scenario="leak")
+        result = srv.analyze_source(data=envelope["text"], seed=42)
+        return (envelope, result)
 
-    assert isinstance(result, mcp_types.CallToolResult) or hasattr(result, "content")
+    envelope, result = run()
     payload = result.structured_content
     assert payload["status"] == "success"
-    assert payload["data_source"] == rd.DATA_SOURCE_SIMULATED
+    assert payload["data_source"] == mt.DATA_SOURCE_SIMULATED
     assert payload["summary"]["count"] == len(envelope["monitoring"]["气体浓度"])
     assert [c["name"] for c in payload["artifacts"]["charts"]] == ["预测源分布_Top12", "置信度分布"]
     assert payload["artifacts"]["plume_maps"] == [], "plume_events 默认 0 时不应生成烟羽地图"
@@ -115,55 +129,59 @@ def test_analyze_source_returns_report_and_charts():
 
 
 def test_analyze_source_accepts_structured_and_raw_inputs():
-    with tempfile.TemporaryDirectory() as tmp:
-        original = paths.OUTPUT_DIR
-        paths.OUTPUT_DIR = tmp  # type: ignore[assignment]
-        try:
-            envelope = srv.get_monitoring_data(seed=7, scenario="normal", point_count=4)
-            by_monitoring = srv.analyze_source(data=envelope["monitoring"], seed=7)
-            assert by_monitoring.structured_content["status"] == "success"
-            assert by_monitoring.structured_content["summary"]["count"] == 4
+    @_with_temp_output
+    def run():
+        envelope = srv.get_monitoring_data(source="simulated", seed=7, scenario="normal",
+                                           point_count=4)
+        by_monitoring = srv.analyze_source(data=envelope["monitoring"], seed=7)
+        by_lines = srv.analyze_source(data=envelope["sample_lines"])
+        raw = srv.analyze_source(data="传感器030，位置为生产指挥中心，风速为2级，风向为东北风")
+        return envelope, by_monitoring, by_lines, raw
 
-            single = srv.analyze_source(data="传感器141，位置为生产指挥中心，风速为2级，风向为东北风")
-            payload = single.structured_content
-            assert payload["status"] == "success"
-            # 单条样本同样会画「预测源分布 / 置信度分布」两张图
-            assert len([c for c in single.content if getattr(c, "type", None) == "image"]) == 2
-        finally:
-            paths.OUTPUT_DIR = original  # type: ignore[assignment]
+    envelope, by_monitoring, by_lines, raw = run()
+    assert by_monitoring.structured_content["summary"]["count"] == 4
+    assert by_lines.structured_content["summary"]["count"] == len(envelope["sample_lines"])
     # 用户直接给出的样本行未声明来源，应如实标注为 USER 而不是 SIMULATED
-    assert payload["data_source"] == "USER"
+    assert raw.structured_content["data_source"] == mt.DATA_SOURCE_USER
+    assert len([c for c in raw.content if getattr(c, "type", None) == "image"]) == 2
 
 
 def test_analyze_source_accepts_json_round_trip():
     """客户端把上一个工具的结果 JSON 整段回传时，也必须能正确解析出样本。"""
-    import json
+    @_with_temp_output
+    def run():
+        envelope = srv.get_monitoring_data(source="simulated", seed=5, scenario="leak",
+                                           point_count=4)
+        return envelope, srv.analyze_source(data=json.dumps(envelope, ensure_ascii=False), seed=5)
 
-    with tempfile.TemporaryDirectory() as tmp:
-        original = paths.OUTPUT_DIR
-        paths.OUTPUT_DIR = tmp  # type: ignore[assignment]
-        try:
-            envelope = srv.get_monitoring_data(seed=5, scenario="leak", point_count=4)
-            result = srv.analyze_source(data=json.dumps(envelope, ensure_ascii=False), seed=5)
-        finally:
-            paths.OUTPUT_DIR = original  # type: ignore[assignment]
-    summary = result.structured_content["summary"]
-    assert summary["count"] == 4, summary
-    assert result.structured_content["data_source"] == rd.DATA_SOURCE_SIMULATED
+    envelope, result = run()
+    assert result.structured_content["summary"]["count"] == 4
+    assert result.structured_content["data_source"] == mt.DATA_SOURCE_SIMULATED
+
+
+def test_analyze_source_auto_fetches_data():
+    @_with_temp_output
+    def run():
+        return srv.analyze_source(source="simulated", seed=2)
+
+    result = run()
+    assert result.structured_content["status"] == "success"
+    assert result.structured_content["data_source"] == mt.DATA_SOURCE_SIMULATED
 
 
 def test_analyze_source_can_plume_maps():
-    with tempfile.TemporaryDirectory() as tmp:
-        original = paths.OUTPUT_DIR
-        paths.OUTPUT_DIR = tmp  # type: ignore[assignment]
-        try:
-            result = srv.analyze_source(seed=3, point_count=3, scenario="leak", plume_events=1)
-            plume_maps = result.structured_content["artifacts"]["plume_maps"]
-            assert plume_maps, "plume_events>0 时应生成烟羽地图 + 总览页"
-            assert all(os.path.exists(path) for path in plume_maps), plume_maps
-            assert any(path.endswith("index.html") for path in plume_maps), plume_maps
-        finally:
-            paths.OUTPUT_DIR = original  # type: ignore[assignment]
+    @_with_temp_output
+    def run():
+        envelope = srv.get_monitoring_data(source="simulated", seed=3, scenario="leak",
+                                           point_count=3)
+        result = srv.analyze_source(data=envelope["text"], seed=3, plume_events=1)
+        plume_maps = result.structured_content["artifacts"]["plume_maps"]
+        assert plume_maps, "plume_events>0 时应生成烟羽地图 + 总览页"
+        assert all(os.path.exists(path) for path in plume_maps), plume_maps
+        assert any(path.endswith("index.html") for path in plume_maps), plume_maps
+        return result
+
+    run()
 
 
 def test_mcp_client_round_trip():
@@ -173,20 +191,17 @@ def test_mcp_client_round_trip():
     async def _call():
         async with Client(srv.mcp) as client:
             tools = await client.list_tools()
-            data_result = await client.call_tool("get-monitoring-data", {"seed": 42, "point_count": 3})
-            text = data_result.content[0].text
-            assert "【数据来源】" in text
+            data_result = await client.call_tool(
+                "get-monitoring-data", {"seed": 42, "point_count": 3, "source": "simulated"})
+            text = data_result.structured_content["text"]
             analysis_result = await client.call_tool("analyze-source", {"data": text, "seed": 42})
             return {t.name for t in tools}, analysis_result
 
-    with tempfile.TemporaryDirectory() as tmp:
-        original = paths.OUTPUT_DIR
-        paths.OUTPUT_DIR = tmp  # type: ignore[assignment]
-        try:
-            names, result = asyncio.run(_call())
-        finally:
-            paths.OUTPUT_DIR = original  # type: ignore[assignment]
+    @_with_temp_output
+    def run():
+        return asyncio.run(_call())
 
+    names, result = run()
     assert names == EXPECTED_TOOLS
     types = [getattr(c, "type", None) for c in result.content]
     assert types.count("image") >= 1 and "text" in types

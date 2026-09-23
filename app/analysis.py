@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
 """溯源分析流水线：监测数据 → 样本行 → 模型推理 → 坐标/风况 → 汇总 → 图表 / Excel / 烟羽地图。
 
-输入支持四种形态（见 :func:`resolve_inputs`）：
-1. 固定格式监测文本（``get-monitoring-data`` 返回的 ``text``，含【气体浓度】【气象】段落）；
-2. 结构化监测数据（``monitoring`` 字典）；
-3. 一行一条的样本行（``传感器141，位置为生产指挥中心，风速为2级，风向为东北风``）；
-4. 什么都不传：自动获取一批监测数据（默认仿真 SIMULATED）。
+输入四种形态（见 :func:`resolve_inputs`）：
+1. ``get-monitoring-data`` 返回的 text（历史监测文本或固定格式的仿真数据文本）；
+2. ``monitoring`` 结构化数据（仿真批次）；
+3. 一行一条的样本行（``传感器030，位置为生产指挥中心，风速为2级，风向为东北风``）；
+4. 什么都不传：自动取一批数据（``source`` 决定取测试文本还是仿真数据）。
 
 输出：逐条预测记录、统计汇总、两张统计图（PNG 字节 + 落盘）、Excel，
 以及可选的逐事件烟羽扩散地图 HTML。数据来源标记全程透传。
@@ -21,34 +21,27 @@ import sys
 from datetime import datetime
 from typing import Any, Iterable, Optional
 
-from . import charts, paths, realtime_data, simulated_data
+from . import charts, monitoring_text, paths, sample_data
 from .model_design import CorpusAnalyzer
 from .predictor import get_predictor, preprocess_prediction_text
 from .plume_visualization import create_plume_visualization
 
 logger = logging.getLogger(__name__)
 
-# 用户直接给出的样本行：未声明来源，不按仿真数据渲染水印，但仍如实标注
-DATA_SOURCE_USER = "USER"
-USER_SOURCE_LABEL = "用户提供（未声明数据来源）"
-
 DEFAULT_COORDINATE = ("117.02127280", "30.53173852")
 DEFAULT_WIND = ("3", "东风")
-
 CONFIDENCE_LEVELS = ((0.8, "高"), (0.5, "中"))
 
 
 def data_source_label(source: Optional[str]) -> str:
-    if source == DATA_SOURCE_USER:
-        return USER_SOURCE_LABEL
-    return realtime_data.DATA_SOURCE_LABEL.get(source or "", source or "未标注")
+    return monitoring_text.data_source_label(source)
 
 
 # ============================================================
 # 1. 文本解析工具
 # ============================================================
 def is_sample_line(line: str) -> bool:
-    return ("传感器" in line) and ("位置为" in line)
+    return sample_data.is_sample_line(line)
 
 
 def extract_true_label(text: str) -> Optional[str]:
@@ -98,11 +91,11 @@ def extract_weather_from_input_text(text: str):
 
 
 def _detect_source_from_text(text: str) -> Optional[str]:
-    """从固定格式文本的【数据来源】行识别来源标记。"""
-    if "SIMULATED" in text or "本地仿真" in text or "仿真数据" in text:
-        return realtime_data.DATA_SOURCE_SIMULATED
-    if "REAL" in text or "现场实测" in text:
-        return realtime_data.DATA_SOURCE_REAL
+    """从文本的【数据来源】行识别来源标记。"""
+    if "SIMULATED" in text or "本地仿真" in text:
+        return monitoring_text.DATA_SOURCE_SIMULATED
+    if "SAMPLE" in text or "历史监测文本" in text:
+        return monitoring_text.DATA_SOURCE_SAMPLE
     return None
 
 
@@ -137,7 +130,7 @@ def parse_monitoring_text(text: str) -> dict:
         if speed:
             speed_ms = float(speed.group("speed"))
             weather["风速"] = speed_ms
-            weather["风速级"] = simulated_data.wind_speed_level(speed_ms)
+            weather["风速级"] = simulated_wind_level(speed_ms)
 
     return {
         "readings": readings,
@@ -148,10 +141,17 @@ def parse_monitoring_text(text: str) -> dict:
     }
 
 
+def simulated_wind_level(speed_ms) -> str:
+    """m/s → 风力等级（沿用仿真模块的量级表，避免循环导入）。"""
+    from .simulated_data import wind_speed_level
+
+    return wind_speed_level(speed_ms)
+
+
 def sample_lines_from_readings(readings: Iterable[dict], weather: Optional[dict] = None) -> list:
     """把点位读数拼成模型可消费的样本行（与原语料库文本同构）。"""
     weather = weather or {}
-    wind_speed = weather.get("风速级") or simulated_data.wind_speed_level(weather.get("风速", 3.0))
+    wind_speed = weather.get("风速级") or simulated_wind_level(weather.get("风速", 3.0))
     wind_direction = weather.get("风向") or DEFAULT_WIND[1]
 
     lines = []
@@ -167,13 +167,13 @@ def sample_lines_from_readings(readings: Iterable[dict], weather: Optional[dict]
 # ============================================================
 # 2. 输入归一化
 # ============================================================
-def resolve_inputs(data=None, seed: Optional[int] = None, scenario: Optional[str] = None,
-                   point_count: int = 6) -> dict:
-    """把四种输入形态统一成 {sample_lines, monitoring, validation, data_source, ...}。"""
+def resolve_inputs(data=None, source: str = sample_data.SOURCE_AUTO, files: int = 2,
+                   max_lines: int = 12, seed: Optional[int] = None,
+                   scenario: Optional[str] = None, point_count: int = 6) -> dict:
+    """把各种输入形态统一成 {sample_lines, monitoring, data_source, ...}。"""
     result: dict = {
         "sample_lines": [],
         "monitoring": None,
-        "validation": None,
         "data_source": None,
         "simulation_id": None,
         "scenario": None,
@@ -181,45 +181,52 @@ def resolve_inputs(data=None, seed: Optional[int] = None, scenario: Optional[str
         "input_mode": "auto",
         "note": "",
         "batch_text": None,
+        "sources": [],
         "error": None,
     }
 
     if data is None:
-        envelope = realtime_data.acquire_monitoring_data(
-            seed=seed, scenario=scenario, point_count=point_count)
+        envelope = sample_data.acquire_data(
+            source=source, files=files, max_lines=max_lines,
+            scenario=scenario, point_count=point_count, seed=seed)
+        if envelope.get("status") != "ok":
+            result["data_source"] = envelope.get("data_source")
+            result["error"] = envelope.get("error") or "未获取到监测数据"
+            return result
         result.update({
-            "data_source": envelope["data_source"],
+            "sample_lines": envelope["sample_lines"],
             "monitoring": envelope.get("monitoring"),
-            "validation": envelope.get("validation"),
+            "data_source": envelope["data_source"],
             "simulation_id": envelope.get("simulation_id"),
             "scenario": envelope.get("scenario"),
             "batch_text": envelope.get("text"),
-            "input_mode": "simulated" if envelope["status"] == "ok" else "unavailable",
-            "note": envelope.get("notice", ""),
+            "notice": envelope.get("notice", ""),
+            "sources": envelope.get("sources", []),
+            "input_mode": envelope.get("source", "auto"),
         })
-        if envelope["status"] != "ok" or not envelope.get("monitoring"):
-            result["error"] = (envelope.get("validation") or {}).get("summary") or "未获取到监测数据"
-            return result
-        result["sample_lines"] = simulated_data.build_sample_lines(envelope["monitoring"])
         return result
 
     if isinstance(data, dict):
         monitoring = data.get("monitoring") if isinstance(data.get("monitoring"), dict) else data
-        source = (data.get("data_source") or monitoring.get("data_source")
-                  or (realtime_data.DATA_SOURCE_SIMULATED if monitoring.get("simulation_id") else None)
-                  or DATA_SOURCE_USER)
+        source_tag = (data.get("data_source")
+                      or monitoring.get("data_source")
+                      or (monitoring_text.DATA_SOURCE_SIMULATED if monitoring.get("simulation_id")
+                          else None)
+                      or monitoring_text.DATA_SOURCE_USER)
         result.update({
-            "data_source": source,
+            "data_source": source_tag,
             "monitoring": monitoring,
             "simulation_id": data.get("simulation_id") or monitoring.get("simulation_id"),
             "scenario": data.get("scenario") or monitoring.get("scenario"),
             "batch_text": data.get("text"),
+            "notice": data.get("notice", ""),
+            "sources": data.get("sources", []) or [],
             "input_mode": "monitoring",
-            "note": data.get("notice", ""),
         })
         if monitoring.get("气体浓度"):
-            result["validation"] = realtime_data.validate_monitoring_data(monitoring, source)
-            result["sample_lines"] = simulated_data.build_sample_lines(monitoring)
+            from .simulated_data import build_sample_lines
+
+            result["sample_lines"] = build_sample_lines(monitoring)
         elif data.get("sample_lines"):
             result["sample_lines"] = [str(x) for x in data["sample_lines"]]
         elif data.get("text"):
@@ -229,7 +236,7 @@ def resolve_inputs(data=None, seed: Optional[int] = None, scenario: Optional[str
 
     if isinstance(data, (list, tuple)):
         result.update({
-            "data_source": DATA_SOURCE_USER,
+            "data_source": monitoring_text.DATA_SOURCE_USER,
             "input_mode": "sample_lines",
             "sample_lines": [str(x) for x in data],
         })
@@ -245,14 +252,14 @@ def resolve_inputs(data=None, seed: Optional[int] = None, scenario: Optional[str
         except ValueError:
             decoded = None
         if decoded is not None and not isinstance(decoded, str):
-            return resolve_inputs(decoded, seed=seed, scenario=scenario, point_count=point_count)
+            return resolve_inputs(decoded, seed=seed)
 
     # 单行样本行长度有限；几百字符以上的行基本是 JSON/日志，不作为样本
     lines = [line.strip() for line in text.splitlines()
              if is_sample_line(line) and len(line) <= 300]
     parsed = parse_monitoring_text(text)
     result.update({
-        "data_source": parsed["data_source"] or DATA_SOURCE_USER,
+        "data_source": parsed["data_source"] or monitoring_text.DATA_SOURCE_USER,
         "input_mode": "monitoring_text" if parsed["readings"] else "sample_lines",
         "simulation_id": parsed["simulation_id"],
         "scenario": parsed["scenario"],
@@ -261,8 +268,6 @@ def resolve_inputs(data=None, seed: Optional[int] = None, scenario: Optional[str
         result["sample_lines"] = lines  # 样本行自带风速/风向
     else:
         result["sample_lines"] = sample_lines_from_readings(parsed["readings"], parsed["weather"])
-        if parsed["readings"]:
-            result["monitoring"] = {"气体浓度": parsed["readings"], "气象": parsed["weather"]}
     if not result["sample_lines"]:
         result["error"] = "没有解析到可用样本行（需要含“传感器”与“位置为”的行，或固定格式监测文本）"
     return result
@@ -474,14 +479,14 @@ def write_placeholder_kml(path, monitoring: Optional[dict], base_lon: float = 11
         {"区域名称": "示例区域", "类型": "装置区", "相对位置": "示例"}
     ]
     parts = ['<?xml version="1.0" encoding="UTF-8"?>', "<kml><Document>"]
-    parts.append("<name>示例点位底图（仿真占位，非真实厂区坐标）</name>")
+    parts.append("<name>示例点位底图（占位生成，非真实厂区坐标）</name>")
     for i, area in enumerate(areas):
         lon = base_lon + (i % 3) * 0.004
         lat = base_lat - (i // 3) * 0.004
         name = f"示例点位-{area.get('区域名称', i + 1)}"
         parts.append(
             f"<Placemark><name>{name}</name>"
-            f"<description>示例底图占位点位（仿真生成），类型：{area.get('类型', '')}</description>"
+            f"<description>示例底图占位点位，类型：{area.get('类型', '')}</description>"
             f"<Point><coordinates>{lon:.6f},{lat:.6f},0</coordinates></Point>"
             f"<Polygon><outerBoundaryIs><LinearRing><coordinates>"
             f"{lon - 0.0015:.6f},{lat - 0.0015:.6f},0 "
@@ -548,7 +553,7 @@ def generate_plume_maps(kml_path, excel_path, plume_dir, max_events: Optional[in
         ]
         banner = (
             '<p style="padding:10px;border:2px solid #c0392b;color:#c0392b;font-weight:bold;">'
-            f'本页所有地图的数据来源为 {data_source_label_text}，非现场实测，严禁用于现场处置决策。</p>'
+            f'本页所有地图的数据来源为 {data_source_label_text}，严禁用于现场处置决策。</p>'
         ) if data_source_label_text else ""
         html_body = f"""<!DOCTYPE html><html lang="zh"><head><meta charset="utf-8">
 <title>烟羽扩散可视化 - 事件总览</title></head><body style="font-family:Microsoft YaHei;">
@@ -563,7 +568,7 @@ def generate_plume_maps(kml_path, excel_path, plume_dir, max_events: Optional[in
 
 
 # ============================================================
-# 5. 结果文本（给模型/人看的摘要，与旧版终端输出对应）
+# 5. 结果文本（给模型/人看的摘要）
 # ============================================================
 def format_analysis_text(payload: dict) -> str:
     """把分析结果渲染成可读文本（MCP 返回的 text 内容）。"""
@@ -579,10 +584,10 @@ def format_analysis_text(payload: dict) -> str:
         batch.append(f"批次 {payload['simulation_id']}")
     if payload.get("scenario"):
         batch.append(f"场景 {payload['scenario']}")
+    for item in payload.get("input", {}).get("sources", []):
+        batch.append(f"{item['file']}（{item['lines']} 行）")
     batch.append(f"样本数 {payload['summary']['count']}")
     lines.append("批次信息：" + " ｜ ".join(batch))
-    if payload.get("validation"):
-        lines.append(f"数据校验：{payload['validation']['summary']}")
     lines.append("")
 
     lines.append("-" * 56)
@@ -647,25 +652,30 @@ def format_analysis_text(payload: dict) -> str:
 # ============================================================
 # 6. 对外主入口
 # ============================================================
-def run_analysis(data=None, seed: Optional[int] = None, scenario: Optional[str] = None,
-                 point_count: int = 6, top_k: int = 3, plume_events: int = 0,
-                 output_root=None, run_dir=None) -> dict:
+def run_analysis(data=None, source: str = sample_data.SOURCE_AUTO, files: int = 2,
+                 max_lines: int = 12, seed: Optional[int] = None,
+                 scenario: Optional[str] = None, point_count: int = 6, top_k: int = 3,
+                 plume_events: int = 0, output_root=None, run_dir=None) -> dict:
     """执行一次完整溯源分析，返回可直接作为 MCP 结构化结果的字典。"""
-    inputs = resolve_inputs(data, seed=seed, scenario=scenario, point_count=point_count)
-    source = inputs["data_source"]
-    source_text = data_source_label(source)
-    simulated = source == realtime_data.DATA_SOURCE_SIMULATED
+    inputs = resolve_inputs(data, source=source, files=files, max_lines=max_lines,
+                            seed=seed, scenario=scenario, point_count=point_count)
+    source_tag = inputs["data_source"]
+    source_text = data_source_label(source_tag)
+    simulated = source_tag == monitoring_text.DATA_SOURCE_SIMULATED
 
     payload: dict = {
         "status": "success",
-        "data_source": source,
+        "data_source": source_tag,
         "data_source_label": source_text,
-        "notice": inputs.get("note") or "",
+        "notice": inputs.get("note") or monitoring_text.notice_for(source_tag),
         "simulation_id": inputs.get("simulation_id"),
         "scenario": inputs.get("scenario"),
         "seed": inputs.get("seed"),
-        "input": {"mode": inputs["input_mode"], "sample_count": len(inputs["sample_lines"])},
-        "validation": inputs.get("validation"),
+        "input": {
+            "mode": inputs["input_mode"],
+            "sample_count": len(inputs["sample_lines"]),
+            "sources": inputs.get("sources", []),
+        },
         "results": [],
         "summary": {},
         "artifacts": {"run_dir": None, "excel": None, "charts": [], "plume_maps": []},
@@ -674,13 +684,7 @@ def run_analysis(data=None, seed: Optional[int] = None, scenario: Optional[str] 
     if inputs.get("error") or not inputs["sample_lines"]:
         payload["status"] = "error"
         payload["error"] = inputs.get("error") or "没有可分析的样本行"
-        payload["disclaimer"] = (
-            realtime_data.UNAVAILABLE_NOTICE
-            if source == realtime_data.DATA_SOURCE_UNAVAILABLE else ""
-        )
-        payload["text_report"] = format_analysis_text(payload) if payload["results"] else (
-            f"溯源分析未执行：{payload['error']}\n{payload['disclaimer']}"
-        )
+        payload["text_report"] = f"溯源分析未执行：{payload['error']}"
         return payload
 
     try:
@@ -695,7 +699,8 @@ def run_analysis(data=None, seed: Optional[int] = None, scenario: Optional[str] 
     monitoring = inputs.get("monitoring")
     batch_weather = monitoring.get("气象") if isinstance(monitoring, dict) else None
     payload["results"] = analyze_lines(
-        inputs["sample_lines"], source, corpus=corpus, top_k=top_k, batch_weather=batch_weather)
+        inputs["sample_lines"], source_tag, corpus=corpus, top_k=top_k,
+        batch_weather=batch_weather)
     payload["summary"] = summarize(payload["results"])
     logger.info("溯源分析完成：%s 条样本，来源 %s", payload["summary"]["count"], source_text)
 
@@ -725,10 +730,7 @@ def run_analysis(data=None, seed: Optional[int] = None, scenario: Optional[str] 
             kml_path, excel_path, os.path.join(str(run_path), "plume"),
             max_events=plume_events, data_source_label_text=source_text)
 
-    payload["disclaimer"] = (
-        realtime_data.SIMULATION_NOTICE if simulated
-        else (realtime_data.REAL_NOTICE if source == realtime_data.DATA_SOURCE_REAL else "")
-    )
+    payload["disclaimer"] = monitoring_text.notice_for(source_tag)
     payload["text_report"] = format_analysis_text(payload)
     return payload
 
@@ -736,5 +738,5 @@ def run_analysis(data=None, seed: Optional[int] = None, scenario: Optional[str] 
 __all__ = [
     "run_analysis", "resolve_inputs", "analyze_lines", "summarize", "result_rows",
     "format_analysis_text", "parse_monitoring_text", "sample_lines_from_readings",
-    "clean_source_name", "data_source_label", "DATA_SOURCE_USER",
+    "clean_source_name", "data_source_label",
 ]

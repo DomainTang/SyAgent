@@ -29,7 +29,7 @@ HTTP 触发器时才会用到，见第 3 节。
     "shihua-mcp": {
       "command": "uvx",
       "args": ["--from", "shihua-mcp", "shihua-mcp"],
-      "env": {"SHIHUA_DATA_MODE": "simulate"}
+      "env": {}
     }
   }
 }
@@ -43,7 +43,7 @@ HTTP 触发器时才会用到，见第 3 节。
     "shihua-mcp": {
       "command": "python",
       "args": ["-m", "shihua_mcp.server"],
-      "env": {"SHIHUA_DATA_MODE": "simulate"}
+      "env": {}
     }
   }
 }
@@ -86,7 +86,7 @@ Streamable HTTP: https://<你的域名>/mcp
 SSE:             https://<你的域名>/sse
 ```
 
-## 4. 模型权重必须可达（部署前必做）
+## 4. 模型权重与测试文本（部署前必做）
 
 `.gitignore` 默认忽略 `models/`，而溯源分析必须有 `voc_model_retrained.pth`
 （约 15 MB）或 `voc_model.pth`。三种做法任选：
@@ -99,6 +99,9 @@ SSE:             https://<你的域名>/sse
 启动日志里出现 `模型加载成功: ...` 才算就绪；出现
 `未找到 voc_model_retrained.pth / voc_model.pth` 时，`analyze-source` 会如实报错。
 
+取数不依赖现场数据源：`data/测试文本*.txt` 随仓库提供，`source=sample`（默认 `auto`）
+直接随机抽样；需要带气体浓度/气象/隐患台账的整批数据时用 `source=simulated`。
+
 ## 5. ModelScope 创建页建议填写内容
 
 | 字段 | 建议值 |
@@ -109,16 +112,16 @@ SSE:             https://<你的域名>/sse
 | 来源地址 | 你的 GitHub 仓库 URL |
 | 托管类型 | 可托管部署 |
 | 部署方式 | Stdio（推荐，自动生成 SSE）；或容器 + HTTP（见第 3 节） |
-| 环境变量 | `SHIHUA_DATA_MODE=simulate`（演示）；接入现场数据见第 6 节 |
+| 环境变量 | 无（默认从仓库内置测试文本取数；需要仿真数据时由工具参数 `source=simulated` 指定） |
 
 ### 可直接复制的“服务介绍”
 
-> 石化疑似源识别 MCP 服务：提供「厂区多源监测数据生成」与「疑似源溯源分析」两个工具。
-> `get-monitoring-data` 一次返回气体浓度、气象、设备隐患台账与厂区布置数据；
-> `analyze-source` 对监测数据逐点位识别疑似源（含经纬度、置信度、Top3 候选），
-> 给出预测源分布与置信度统计，并绘制预测源分布图、置信度分布图（图片内联返回），
-> 可选生成烟羽扩散地图。所有输出均如实标注数据来源（SIMULATED / REAL / USER / UNAVAILABLE），
-> 仿真数据严禁用于现场处置决策。
+> 石化疑似源识别 MCP 服务，只提供两个工具：`get-monitoring-data`（数据获取）与
+> `analyze-source`（模型分析并绘图）。取数支持仓库内置历史监测文本随机抽样（SAMPLE）
+> 与本地仿真生成（SIMULATED，含气体浓度、气象、设备隐患台账、厂区布置）；
+> 分析工具逐点位识别疑似源（含经纬度、置信度、Top3 候选），给出预测源分布与置信度统计，
+> 并绘制预测源分布图、置信度分布图（图片内联返回），可选生成烟羽扩散地图。
+> 所有输出均如实标注数据来源（SAMPLE / SIMULATED / USER），仿真数据严禁用于现场处置决策。
 
 ## 6. 环境变量清单
 
@@ -128,21 +131,11 @@ SSE:             https://<你的域名>/sse
 | `HOST` / `PORT` | `0.0.0.0` / `8000` | HTTP/SSE 监听地址与端口 |
 | `MCP_HTTP_PATH` | `/mcp` | Streamable HTTP 路径 |
 | `MCP_CORS_ORIGINS` | `*` | 公网部署请改成具体域名 |
-| `SHIHUA_DATA_MODE` | `simulate` | `simulate` / `real` / `auto` / `off` |
-| `SHIHUA_REALTIME_ENDPOINT` | 无 | 现场 GDS/DCS 数据端点，`real` 模式使用 |
 | `SHIHUA_MODELS_DIR` | 仓库 `models/` | 模型权重目录 |
 | `SHIHUA_DATA_DIR` | 仓库 `data/` | 语料库与 KML 目录 |
 | `SHIHUA_OUTPUT_DIR` | 仓库 `output/` | 产物目录（需可写；只读文件系统请指向 `/tmp`） |
 
-接入现场数据（示例）：
-
-```bash
-export SHIHUA_REALTIME_ENDPOINT=http://10.0.0.20:8080/gds/realtime   # 返回一节 JSON 即可
-export SHIHUA_DATA_MODE=real
-python -m shihua_mcp.server
-```
-
-`real` 模式调用失败时如实返回 `UNAVAILABLE` 与失败原因，**不会**静默回落到仿真数据。
+数据来源由工具参数决定，不需要环境变量：`get-monitoring-data(source="sample" | "simulated" | "auto")`。
 
 ## 7. 本地冒烟验证
 
